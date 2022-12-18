@@ -10,6 +10,7 @@
 package net.mamoe.mirai.console.internal.plugin
 
 import kotlinx.atomicfu.AtomicLong
+import kotlinx.atomicfu.atomic
 import kotlinx.atomicfu.locks.withLock
 import kotlinx.coroutines.*
 import net.mamoe.mirai.console.MiraiConsole
@@ -25,6 +26,7 @@ import net.mamoe.mirai.console.plugin.Plugin
 import net.mamoe.mirai.console.plugin.PluginManager
 import net.mamoe.mirai.console.plugin.PluginManager.INSTANCE.safeLoader
 import net.mamoe.mirai.console.plugin.ResourceContainer.Companion.asResourceContainer
+import net.mamoe.mirai.console.plugin.id
 import net.mamoe.mirai.console.plugin.jvm.AbstractJvmPlugin
 import net.mamoe.mirai.console.plugin.jvm.JvmPlugin
 import net.mamoe.mirai.console.plugin.jvm.JvmPlugin.Companion.onLoad
@@ -47,6 +49,68 @@ internal val <T> T.job: Job where T : CoroutineScope, T : Plugin get() = this.co
 internal abstract class JvmPluginInternal(
     parentCoroutineContext: CoroutineContext,
 ) : JvmPlugin, CoroutineScope {
+    internal enum class PluginStatus {
+        ALLOCATED,
+
+        CRASHED_LOAD_ERROR,
+        CRASHED_ENABLE_ERROR,
+        CRASHED_DISABLE_ERROR,
+
+        LOAD_PENDING,
+        LOAD_LOADING,
+        LOAD_LOAD_DONE,
+
+        ENABLE_PENDING,
+        ENABLE_ENABLING,
+        ENABLED,
+
+        DISABLE_PENDING,
+        DISABLE_DISABLING,
+        DISABLED,
+
+        ;
+
+        internal companion object {
+            internal val ALLOWED_TO_SWITCH_TO_DISABLE = EnumSet.of(
+                CRASHED_LOAD_ERROR,
+                CRASHED_ENABLE_ERROR,
+                ENABLED,
+            )
+        }
+    }
+
+    private val pluginStatus = atomic(PluginStatus.ALLOCATED)
+
+    @get:JvmSynthetic
+    internal val currentPluginStatus: PluginStatus get() = pluginStatus.value
+
+    final override val isEnabled: Boolean
+        get() = pluginStatus.value === PluginStatus.ENABLED
+
+    @JvmSynthetic
+    internal fun switchStatusOrFailed(expect: Collection<PluginStatus>, update: PluginStatus) {
+        val nowStatus = pluginStatus.value
+        if (nowStatus in expect) {
+            if (pluginStatus.compareAndSet(expect = nowStatus, update = update)) {
+                return
+            }
+            error("Failed to switch plugin '$id' status from $nowStatus to $update, current status = ${pluginStatus.value}")
+        }
+        error("Failed to switch plugin '$id' status from one status of $expect to $update, current status = $nowStatus")
+    }
+
+    @JvmSynthetic
+    internal fun switchStatusOrFailed(expect: PluginStatus, update: PluginStatus) {
+        val nowStatus = pluginStatus.value
+        if (nowStatus === expect) {
+            if (pluginStatus.compareAndSet(expect = expect, update = update)) {
+                return
+            }
+            error("Failed to switch plugin '$id' status from $expect to $update, current status=${pluginStatus.value}")
+        }
+        error("Failed to switch plugin '$id' status from $expect to $update, current status = $nowStatus")
+    }
+
 
     final override val parentPermission: Permission by lazy {
         PermissionService.INSTANCE.register(
@@ -55,8 +119,6 @@ internal abstract class JvmPluginInternal(
         )
     }
 
-    final override var isEnabled: Boolean = false
-        internal set
 
     private val resourceContainerDelegate by lazy { this::class.java.classLoader.asResourceContainer() }
     final override fun getResourceAsStream(path: String): InputStream? =
@@ -88,20 +150,31 @@ internal abstract class JvmPluginInternal(
     }
 
     internal fun internalOnDisable() {
+
+        switchStatusOrFailed(
+            update = PluginStatus.DISABLE_PENDING,
+            expect = PluginStatus.ALLOWED_TO_SWITCH_TO_DISABLE,
+        )
+
         firstRun = false
         kotlin.runCatching {
             val crtThread = Thread.currentThread()
             ShutdownDaemon.pluginDisablingThreads.add(crtThread)
             try {
+                pluginStatus.value = PluginStatus.DISABLE_DISABLING
                 onDisable()
             } finally {
                 ShutdownDaemon.pluginDisablingThreads.remove(crtThread)
             }
         }.fold(
             onSuccess = {
+                pluginStatus.value = PluginStatus.DISABLED
+
                 cancel(CancellationException("plugin disabled"))
             },
             onFailure = { err ->
+                pluginStatus.value = PluginStatus.CRASHED_DISABLE_ERROR
+
                 cancel(CancellationException("Exception while disabling plugin", err))
 
                 // @TestOnly
@@ -112,17 +185,32 @@ internal abstract class JvmPluginInternal(
                 }
             }
         )
-        isEnabled = false
     }
 
     @Throws(Throwable::class)
     internal fun internalOnLoad() {
-        val componentStorage = PluginComponentStorage(this)
-        onLoad(componentStorage)
-        GlobalComponentStorage.mergeWith(componentStorage)
+        switchStatusOrFailed(PluginStatus.ALLOCATED, PluginStatus.LOAD_PENDING)
+
+        try {
+            pluginStatus.value = PluginStatus.LOAD_LOADING
+
+            val componentStorage = PluginComponentStorage(this)
+            onLoad(componentStorage)
+
+            pluginStatus.value = PluginStatus.LOAD_LOAD_DONE
+            GlobalComponentStorage.mergeWith(componentStorage)
+
+        } catch (e: Throwable) {
+            pluginStatus.value = PluginStatus.CRASHED_LOAD_ERROR
+
+            cancel(CancellationException("Exception while loading plugin", e))
+        }
     }
 
+
     internal fun internalOnEnable(): Boolean {
+        switchStatusOrFailed(PluginStatus.LOAD_LOAD_DONE, PluginStatus.ENABLE_PENDING)
+
         parentPermission
         if (!firstRun) refreshCoroutineContext()
 
@@ -133,6 +221,7 @@ internal abstract class JvmPluginInternal(
         }
 
         kotlin.runCatching {
+            pluginStatus.value = PluginStatus.ENABLE_ENABLING
             onEnable()
         }.fold(
             onSuccess = {
@@ -142,10 +231,12 @@ internal abstract class JvmPluginInternal(
                     logger.error(msg)
                     throw AssertionError(msg)
                 }
-                isEnabled = true
+                pluginStatus.value = PluginStatus.ENABLED
                 return true
             },
             onFailure = { err ->
+                pluginStatus.value = PluginStatus.CRASHED_ENABLE_ERROR
+
                 cancel(CancellationException("Exception while enabling plugin", err))
                 logger.error(err)
 
@@ -189,6 +280,7 @@ internal abstract class JvmPluginInternal(
 
     // for future use
     @Suppress("PropertyName")
+    @get:JvmSynthetic
     internal val _intrinsicCoroutineContext: CoroutineContext by lazy {
         this as AbstractJvmPlugin
         CoroutineName("Plugin $dataHolderName")
@@ -211,6 +303,7 @@ internal abstract class JvmPluginInternal(
     }
 
     @JvmField
+    @JvmSynthetic
     internal val coroutineContextInitializer = {
         CoroutineExceptionHandler { context, throwable ->
             if (throwable.rootCauseOrSelf !is CancellationException) logger.error(
@@ -228,7 +321,9 @@ internal abstract class JvmPluginInternal(
             job.invokeOnCompletion { e ->
                 if (e != null) {
                     if (e !is CancellationException) logger.error(e)
-                    if (this.isEnabled) safeLoader.disable(this)
+                    if (pluginStatus.value == PluginStatus.ENABLED) {
+                        safeLoader.disable(this)
+                    }
                 }
             }
         }
