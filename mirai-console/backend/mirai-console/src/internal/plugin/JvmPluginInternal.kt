@@ -52,8 +52,8 @@ internal abstract class JvmPluginInternal(
     internal enum class PluginStatus {
         ALLOCATED,
 
-        CRASHED_LOAD_ERROR,
-        CRASHED_ENABLE_ERROR,
+        CRASHED_LOAD_ERROR(Flags.ALLOW_SWITCH_TO_DISABLE),
+        CRASHED_ENABLE_ERROR(Flags.ALLOW_SWITCH_TO_DISABLE),
         CRASHED_DISABLE_ERROR,
 
         LOAD_PENDING,
@@ -62,7 +62,7 @@ internal abstract class JvmPluginInternal(
 
         ENABLE_PENDING,
         ENABLE_ENABLING,
-        ENABLED,
+        ENABLED(Flags.ALLOW_SWITCH_TO_DISABLE),
 
         DISABLE_PENDING,
         DISABLE_DISABLING,
@@ -70,13 +70,18 @@ internal abstract class JvmPluginInternal(
 
         ;
 
-        internal companion object {
-            internal val ALLOWED_TO_SWITCH_TO_DISABLE = EnumSet.of(
-                CRASHED_LOAD_ERROR,
-                CRASHED_ENABLE_ERROR,
-                ENABLED,
-            )
+        private val flags: Int
+
+        constructor() : this(0)
+        constructor(flags: Int) {
+            this.flags = flags
         }
+
+        internal object Flags { // compiler bug: [UNINITIALIZED_VARIABLE] Variable 'FLAG_ALLOW_SWITCH_TO_DISABLE' must be initialized
+            internal const val ALLOW_SWITCH_TO_DISABLE = 1 shl 0
+        }
+
+        fun hasFlag(flag: Int): Boolean = flags.and(flag) != 0
     }
 
     private val pluginStatus = atomic(PluginStatus.ALLOCATED)
@@ -88,19 +93,19 @@ internal abstract class JvmPluginInternal(
         get() = pluginStatus.value === PluginStatus.ENABLED
 
     @JvmSynthetic
-    internal fun switchStatusOrFailed(expect: Collection<PluginStatus>, update: PluginStatus) {
+    internal fun switchStatusOrFail(expectFlag: Int, update: PluginStatus) {
         val nowStatus = pluginStatus.value
-        if (nowStatus in expect) {
+        if (nowStatus.hasFlag(expectFlag)) {
             if (pluginStatus.compareAndSet(expect = nowStatus, update = update)) {
                 return
             }
             error("Failed to switch plugin '$id' status from $nowStatus to $update, current status = ${pluginStatus.value}")
         }
-        error("Failed to switch plugin '$id' status from one status of $expect to $update, current status = $nowStatus")
+        error("Failed to switch plugin '$id' status to $update because current status $nowStatus doesn't contain flag ${Integer.toBinaryString(expectFlag)}")
     }
 
     @JvmSynthetic
-    internal fun switchStatusOrFailed(expect: PluginStatus, update: PluginStatus) {
+    internal fun switchStatusOrFail(expect: PluginStatus, update: PluginStatus) {
         val nowStatus = pluginStatus.value
         if (nowStatus === expect) {
             if (pluginStatus.compareAndSet(expect = expect, update = update)) {
@@ -151,9 +156,9 @@ internal abstract class JvmPluginInternal(
 
     internal fun internalOnDisable() {
 
-        switchStatusOrFailed(
+        switchStatusOrFail(
+            expectFlag = PluginStatus.Flags.ALLOW_SWITCH_TO_DISABLE,
             update = PluginStatus.DISABLE_PENDING,
-            expect = PluginStatus.ALLOWED_TO_SWITCH_TO_DISABLE,
         )
 
         firstRun = false
@@ -189,7 +194,7 @@ internal abstract class JvmPluginInternal(
 
     @Throws(Throwable::class)
     internal fun internalOnLoad() {
-        switchStatusOrFailed(PluginStatus.ALLOCATED, PluginStatus.LOAD_PENDING)
+        switchStatusOrFail(PluginStatus.ALLOCATED, PluginStatus.LOAD_PENDING)
 
         try {
             pluginStatus.value = PluginStatus.LOAD_LOADING
@@ -209,7 +214,7 @@ internal abstract class JvmPluginInternal(
 
 
     internal fun internalOnEnable(): Boolean {
-        switchStatusOrFailed(PluginStatus.LOAD_LOAD_DONE, PluginStatus.ENABLE_PENDING)
+        switchStatusOrFail(PluginStatus.LOAD_LOAD_DONE, PluginStatus.ENABLE_PENDING)
 
         parentPermission
         if (!firstRun) refreshCoroutineContext()
